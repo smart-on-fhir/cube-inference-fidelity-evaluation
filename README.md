@@ -2,7 +2,7 @@
 
 This repository implements a Bayesian count-inference pipeline for "cube" releases — tables of aggregate counts over every subset of a set of categorical grouping variables, with cells below a suppression threshold withheld. 
 
-The pipeline infers the suppressed cells, and the same reconstruction is used to (1) measure statistical fidelity of the cube against the original line-level data, (2) evaluate analytical utility on descriptive, inferential, and predictive tasks, and (3) quantify how much suppressed information the reconstruction recovers, i.e., the privacy risk of threshold suppression. CTGAN synthetic data serves as the comparator throughout.
+The pipeline infers the suppressed cells, and the same reconstruction is used to (1) measure statistical fidelity of the cube against the original line-level data, (2) evaluate analytical utility on descriptive, inferential, and predictive tasks, and (3) quantify how much suppressed information the reconstruction recovers, i.e., the privacy risk of threshold suppression. CTGAN synthetic data serves as the comparator throughout, averaged over as many synthetic datasets as there are posterior draws so that it parallels the cube's posterior-mean reconstruction.
 
 ## Repository structure
 
@@ -32,6 +32,15 @@ cmdstanpy.install_cmdstan()
 `run_complete_bayesian_reconstruction()` in `src/infer_counts.py` converts line-level data to cube (at the specified threshold) and runs the full count inference pipeline.
 
 Every fidelity/utility statistic uses one common uncertainty procedure (`src/evaluate.py`): cube reconstruction or CTGAN sample is held fixed while the reference data are resampled with replacement over shared bootstrap indices; each statistic is reported as a bootstrap mean with a 95% percentile confidence interval.
+
+The two releases are reduced to a single fixed surrogate in the same way:
+
+| | Draws | Surrogate |
+|---|---|---|
+| Cube | x posterior atomic-count vectors | mean counts, re-aggregated to one reconstruction |
+| CTGAN | x synthetic datasets of n rows each | mean counts per variable combination, rounded to rows exactly as the cube is |
+
+where x is the number of posterior count vectors (`evaluate.n_posterior_draws(rec)`) and n the cohort size. Every comparator accepts the CTGAN argument either as a single synthetic DataFrame or as the averaged counts returned by `evaluate.ctgan_posterior_mean`.
 
 ## Usage
 
@@ -69,14 +78,23 @@ metadata = SingleTableMetadata()
 metadata.detect_from_dataframe(df)
 synthesizer = CTGANSynthesizer(metadata)   # default hyperparameters
 synthesizer.fit(df)
-synthetic_df = synthesizer.sample(len(df))
+
+import src.evaluate as evaluate
+
+# Mean counts over as many CTGAN datasets (n = len(df) rows each) as the cube has posterior draws
+synthetic_df = evaluate.ctgan_posterior_mean(
+    synthesizer,
+    n_rows=len(df),
+    n_draws=evaluate.n_posterior_draws(rec),
+    demographic_cols=df.columns.tolist(),
+)
 ```
+
+`synthetic_df` is a `pd.Series` of mean counts indexed by variable combination. Passing a single sample (`synthesizer.sample(len(df))`) instead reproduces a one-draw comparison.
 
 ### 3. Evaluate fidelity
 
 ```python
-import src.evaluate as evaluate
-
 cols = df.columns.tolist()
 
 # One shared set of bootstrap resample indices for all statistics
@@ -119,7 +137,8 @@ train_df, test_df = train_test_split(df, test_size=0.20, random_state=42,
                                      stratify=df["outcome_col"])
 rec_train = ifc.run_complete_bayesian_reconstruction(
     df_line_level=train_df, demographic_cols=train_df.columns.tolist(), suppress_threshold=9)
-# ... fit CTGAN on train_df as in step 2 -> synthetic_train_df ...
+# ... fit CTGAN on train_df as in step 2, then average over
+#     evaluate.n_posterior_draws(rec_train) draws of len(train_df) rows -> synthetic_train_df ...
 tidx = evaluate.make_boot_indices(len(test_df), n_boot=2000, seed=0)
 clf = evaluate.compare_classification(train_df, test_df, rec_train, synthetic_train_df,
                                 "outcome_col", cat_cols=["categorical_col_1", "categorical_col_2"],

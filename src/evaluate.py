@@ -80,6 +80,54 @@ def counts_to_line_level(
 
 
 # ---------------------------------------------------------------------------
+# CTGAN averaged over x draws, mirroring the cube's evaluation structure:
+#   Cube : x posterior count vectors -> mean counts -> one fixed reconstruction
+#   CTGAN: x synthetic datasets (n rows each) -> mean counts -> one fixed surrogate
+# with x = number of posterior samples averaged for the cube. In both cases the
+# fixed surrogate is then compared with bootstrap resamples of the original.
+#
+# Every comparator accepts `df_synthetic` as either a DataFrame (one CTGAN
+# draw) or the pd.Series returned by `ctgan_posterior_mean` (x draws averaged).
+# ---------------------------------------------------------------------------
+
+def n_posterior_draws(reconstructed: Dict) -> int:
+    return len(reconstructed["atomic_posterior_samples"])
+
+
+def ctgan_posterior_mean(synthesizer, n_rows, n_draws, demographic_cols, batch_draws=500) -> pd.Series:
+    """Mean count per variable combination over `n_draws` CTGAN datasets of `n_rows` each.
+
+    CTGAN rows are drawn independently, so `k` datasets of `n_rows` are sampled as
+    one batch of `k * n_rows` rows; only the running counts are kept in memory.
+    """
+    cols = list(demographic_cols)
+    total, done = None, 0
+    while done < n_draws:
+        k = min(batch_draws, n_draws - done)
+        counts = synthesizer.sample(n_rows * k)[cols].groupby(cols).size()
+        total = counts if total is None else total.add(counts, fill_value=0)
+        done += k
+    return total / n_draws
+
+
+def ctgan_mean_counts(df_synthetic, cells_df, demographic_cols=None) -> np.ndarray:
+    """CTGAN counts on the atomic cells (analogue of posterior_mean_counts)."""
+    cols = list(demographic_cols) if demographic_cols is not None else _infer_demographic_cols(cells_df)
+    if isinstance(df_synthetic, pd.DataFrame):
+        return atomic_counts_from_line_level(df_synthetic, cells_df, cols)
+    keys = [tuple(r) if len(cols) > 1 else r[0] for r in cells_df[cols].to_numpy()]
+    return df_synthetic.reindex(keys, fill_value=0).to_numpy(dtype=float)
+
+
+def ctgan_line_level(df_synthetic, demographic_cols) -> pd.DataFrame:
+    """Line-level CTGAN data; averaged counts are rounded to rows exactly as the cube is."""
+    cols = list(demographic_cols)
+    if isinstance(df_synthetic, pd.DataFrame):
+        return df_synthetic[cols].copy()
+    return counts_to_line_level(df_synthetic.to_numpy(), df_synthetic.index.to_frame(index=False), cols)
+
+
+# ---------------------------------------------------------------------------
 # Pure metric primitives
 # ---------------------------------------------------------------------------
 
@@ -368,7 +416,7 @@ def _surrogate_line_level(reconstructed, df_synthetic, demographic_cols):
     cube_line = counts_to_line_level(
         posterior_mean_counts(reconstructed), cells_df, demographic_cols
     )
-    return {"Cube": cube_line, "CTGAN": df_synthetic[list(demographic_cols)].copy()}
+    return {"Cube": cube_line, "CTGAN": ctgan_line_level(df_synthetic, demographic_cols)}
 
 
 def distribution_fidelity_ci(
@@ -490,7 +538,7 @@ def compare_r2(
     cells_df = reconstructed["cells_df"]
     surrogate_counts = {
         "Cube": posterior_mean_counts(reconstructed),
-        "CTGAN": atomic_counts_from_line_level(df_synthetic, cells_df, demographic_cols),
+        "CTGAN": ctgan_mean_counts(df_synthetic, cells_df, demographic_cols),
     }
     res = cell_metric_patient_bootstrap(
         df_original, cells_df, surrogate_counts, r2_score,
@@ -519,9 +567,7 @@ def compare_suppressed_mae(
         estimates["Suppressed = random (0-9)"] = rng.integers(
             0, suppress_threshold + 1, size=len(true_counts)
         ).astype(float)
-    estimates["CTGAN synthetic data"] = atomic_counts_from_line_level(
-        df_synthetic, cells_df, demographic_cols
-    )
+    estimates["CTGAN synthetic data"] = ctgan_mean_counts(df_synthetic, cells_df, demographic_cols)
 
     res = cell_metric_patient_bootstrap(
         df_original, cells_df, estimates, mean_absolute_error,
@@ -530,6 +576,63 @@ def compare_suppressed_mae(
     )
     out = {method: fmt_ci(res[method], point_kind="boot_mean") for method in estimates}
     return pd.DataFrame({"MAE (95% CI)": out})
+
+
+def compare_suppressed_recovery(
+    reconstructed, df_synthetic, demographic_cols, small_counts=(1, 2, 3),
+    suppress_threshold=9, seed=DEFAULT_SEED, include_baselines=True,
+):
+    """How many suppressed cube cells each release reveals exactly.
+
+    For every suppressed cell (atomic or aggregate) the estimate is
+      - Cube (ILP, certain):  recovered when the ILP lower and upper bounds coincide
+      - Cube (posterior mean): the rounded posterior-mean count
+      - CTGAN:                the rounded CTGAN count (one draw, or mean over draws)
+      - Guess = 1 / 5 / random (0-9): chance-level baselines (5 and random as in
+        Table 1; 1 is the most common suppressed value. Guessing 0 never matches,
+        since every cube cell holds at least one patient)
+    and a cell counts as recovered when the estimate equals its true count.
+    "All suppressed cells" covers every level of the cube; the k-patient columns
+    cover atomic cells only, matching the paper's small-cell breakdown.
+    """
+    cells_df = reconstructed["cells_df"]
+    powerset_df = reconstructed["powerset_df"]
+    cube_mean = posterior_mean_counts(reconstructed)
+    ctgan = ctgan_mean_counts(df_synthetic, cells_df, demographic_cols)
+    rng = np.random.default_rng(seed)
+
+    rows = []
+    for cid, res in reconstructed["results"].items():
+        idx = res["cell_indices"]
+        lo, hi = res["bounds"]
+        ps_row = powerset_df.iloc[cid]
+        actual = int(ps_row["count_actual"])
+        row = {
+            "actual": actual,
+            # atomic = grouped by every variable (not merely an aggregate covering one cell)
+            "atomic": bool(ps_row[list(demographic_cols)].notna().all()),
+            "Cube (ILP, certain)": lo == hi == actual,
+            "Cube (posterior mean)": int(np.rint(cube_mean[idx].sum())) == actual,
+            "CTGAN": int(np.rint(ctgan[idx].sum())) == actual,
+        }
+        if include_baselines:
+            row["Guess = 1"] = actual == 1
+            row["Guess = 5"] = actual == 5
+            row["Guess = random (0-9)"] = actual == rng.integers(0, suppress_threshold + 1)
+        rows.append(row)
+    df = pd.DataFrame(rows)
+
+    groups = {"All suppressed cells": np.ones(len(df), dtype=bool)}
+    groups.update({f"{k}-patient atomic cells": (df["atomic"] & (df["actual"] == k)).to_numpy()
+                   for k in small_counts})
+    methods = [c for c in df.columns if c not in ("actual", "atomic")]
+    out = {}
+    for m in methods:
+        out[m] = {}
+        for g, mask in groups.items():
+            n, k = int(mask.sum()), int(df.loc[mask, m].sum())
+            out[m][g] = f"{k} of {n} ({100 * k / n:.1f}%)" if n else "–"
+    return pd.DataFrame(out).T.reindex(methods)[list(groups)]
 
 
 def compare_marginal_prob_mae(
@@ -736,10 +839,11 @@ def compare_classification(
     cube_train = counts_to_line_level(
         posterior_mean_counts(reconstructed_train), cells_df, demographic_cols
     )
+    cols = list(demographic_cols) if demographic_cols is not None else list(train_df.columns)
     train_sets = {
         "Original": train_df,
         "Cube": cube_train,
-        "CTGAN": synthetic_train_df,
+        "CTGAN": ctgan_line_level(synthetic_train_df, cols),
     }
     preds: Dict[str, np.ndarray] = {}
     y_true = None
